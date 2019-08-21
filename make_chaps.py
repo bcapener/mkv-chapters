@@ -1,6 +1,6 @@
 import os
 import sys, tempfile, os
-
+import argparse
 import shutil
 import datetime
 import subprocess
@@ -9,10 +9,12 @@ from pymediainfo import MediaInfo
 from collections import OrderedDict, defaultdict
 from xml.etree.ElementTree import Element, SubElement, Comment, tostring, ElementTree
 
+
 def format_time(sec):
     hours, remainder = divmod(sec, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f'{int(hours):02}:{int(minutes):02}:' + f'{seconds:.3f}'.zfill(6)
+
 
 def create_mkv_chapters(entries, file_path, allow_nested=False):
     def add_entry(node, st, et, name):
@@ -31,9 +33,16 @@ def create_mkv_chapters(entries, file_path, allow_nested=False):
     chapters = Element('Chapters')
     edition_entry = SubElement(chapters, 'EditionEntry')
     for headers, (stime_tot, etime_tot, subentries) in entries.items():
-        header_chapter = add_entry(edition_entry, stime_tot, etime_tot, headers)
+
+        if not headers:
+            header_chapter = edition_entry
+        else:
+            # header_chapter = add_entry(edition_entry, stime_tot, etime_tot, headers)
+            header_chapter = add_entry(edition_entry, subentries[0][0], subentries[0][1], headers)
+
         for (stime, etime, subentry) in subentries:
             add_entry((header_chapter if allow_nested else edition_entry), stime, etime, subentry)
+            # add_entry(edition_entry, stime, etime, subentry)
             # header_chapter = SubElement(edition_entry, 'ChapterAtom')
             # start_time = SubElement(header_chapter, 'ChapterTimeStart')
             # start_time.text = format_time(stime_tot)
@@ -173,15 +182,18 @@ def main():
         f.write('\n'.join(lines))
     subprocess.call(['mkvmerge', '-o', combined2, combined, '--chapters', chap_file])
 
-import argparse
+
 def main2():
-    parser = argparse.ArgumentParser(description='Description of your program')
-    parser.add_argument('-p', '--path', type=str, help='Description for foo argument', required=True)
+    parser = argparse.ArgumentParser(description='')
+    parser.add_argument('-p', '--path', type=str, help='', required=True)
     args = parser.parse_args()
+
     main_folder = args.path  # os.path.join('/home', 'brandon', 'Downloads', 'Lynda - Advanced Linux_ The Linux Kernel')  # os.path.join()
     main_folder_name = os.path.basename(main_folder.strip(os.sep))
+
     mkv_out = os.path.join(main_folder, 'mkv_out')
     mkv_tmp = os.path.join(main_folder, 'mkv_tmp')
+
     try:
         shutil.rmtree(mkv_out)
     except:
@@ -266,7 +278,7 @@ def main2():
             sec2 = MediaInfo.parse(tmpfile).tracks[0].duration / 1000
             total_sec2 += sec2
             tmp.append((os.path.basename(tmpfile), sec, sec2))
-        al[fname] = (tmp, total_sec, total_sec2)
+        al[fname] = (tmp, tmp[0][1], tmp[0][2])
     
     # for fname, mkv_files in sorted(all_files.items(), key=lambda x: x[0]):
     #     print(f'{fname}')
@@ -274,7 +286,7 @@ def main2():
     #         print(f'    {f}')
     #         for s in ss:
     #             print(f'        {s}')
-    EDITOR = os.environ.get('EDITOR','vim') #that easy!
+    EDITOR = os.environ.get('EDITOR', 'vim')
     # al = OrderedDict(sorted(al.items(), key=lambda x: x[0])) 
     # al2 = OrderedDict()
     # for k, (v, t, t2) in sorted(al.items(), key=lambda x: x[0]):
@@ -287,8 +299,11 @@ def main2():
     ids = OrderedDict()
     for header, (entries, t, t2) in al.items():
         initial_message += f'D{h:03} {header}\n'
-        ids[f'D{h:03}'] = (header, t, t2)
-        for entry, tt, tt2 in entries:
+        # ids[f'D{h:03}'] = (header, t, t2)
+        for i, (entry, tt, tt2) in enumerate(entries):
+            if i == 0:
+                ids[f'D{h:03}'] = (header, tt, tt2)
+
             initial_message += f' F{e:03} {entry[:-4]}\n'
             ids[f'F{e:03}'] = (entry, tt, tt2)
             e += 1
@@ -305,17 +320,23 @@ def main2():
         # for instance:
         tf.seek(0)
         edited_message = tf.readlines()
+    # edited_message = initial_message.splitlines()
     new_ids = OrderedDict()
-    entries =  OrderedDict()
+    entries = OrderedDict([('', (None, None, [])), ])
     file_order = []
     curr_header = ''
     hsec = 0
     esec = 0
     for msg in edited_message:
         msg = msg.decode().strip()
+        # msg = msg.strip()
         if not msg or msg.startswith('#'):
             continue
-        id_, nmsg = msg.split(' ', maxsplit=1)
+        try:
+            id_, nmsg = msg.split(' ', maxsplit=1)
+        except ValueError:
+            print(msg.split(' ', maxsplit=1))
+            raise
         if id_ == 'TITLE':
             pass
         else:
@@ -327,8 +348,9 @@ def main2():
                 hsec += t
 
             elif id_.startswith('F'):
+                header_name = curr_header  # if nmsg.startswith(' ') else ''  # if file does not start with a space then it is not under a directory, so no header_name.
                 file_order.append(fname)
-                entries[curr_header][2].append((esec, esec + t, nmsg))
+                entries[header_name][2].append((esec, esec + t, nmsg))
                 esec += t
             else:
                 raise(ValueError(f'Unknown ID: {id_}, msg: {msg}'))
@@ -339,6 +361,7 @@ def main2():
 
     combined = os.path.join(mkv_out, 'output.mkv')
     combined2 = os.path.join(main_folder, f'{main_folder_name}.mkv')
+    # combined2_nested = os.path.join(main_folder, f'{main_folder_name}_nested.mkv')
     cmd = ['mkvmerge', '-o', combined]
     for f in file_order:
         f = os.path.join(mkv_out, f)
@@ -351,7 +374,9 @@ def main2():
     subprocess.call(cmd)
 
     print('\nADDING CHAPTERS\n')
-    subprocess.call(['mkvmerge', '-o', combined2, combined, '--chapters', chapter_file])
+    print(f'{combined} -> {combined2}')
+    merge_return_code = subprocess.call(['mkvmerge', '-o', combined2, combined, '--chapters', chapter_file])
+    # subprocess.call(['mkvmerge', '-o', combined2_nested, combined, '--chapters', chapter_file_nested])
     # for k, v in new_ids.items():
     #     print(f'{k}: {v}')
 
