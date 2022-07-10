@@ -228,23 +228,16 @@ def main():
         fname = video_file.orig_path.parent.name
         if fname not in all_files:
             all_files[fname] = []
-        tmp = []
-        total_sec = 0
-        total_sec2 = 0
+
         mkvfile = convert_to_mkv(video_file, mkv_tmp)
         add_subtitles_to_mkv(mkvfile, video_file.get_subtitles())
-        sec = mkvfile.duration_sec
-        total_sec += sec
-
-        sec2 = mkvfile.duration_sec_mediainfo
-        total_sec2 += sec2
 
         all_files[fname].append(mkvfile)
 
     EDITOR = os.environ.get('EDITOR', 'vim')
 
     al = OrderedDict()
-    for k, v in OrderedDict(sorted(all_files.items())).items():
+    for k, v in sorted(all_files.items()):
         al[k] = sorted(v, key=lambda x: x.orig_path.name)
 
     initial_message = f"TITLE {main_folder_name}\n" # if you want to set up the file somehow
