@@ -6,12 +6,40 @@ import shutil
 import datetime
 import subprocess
 import enzyme
-# import srtmerge
 from pymediainfo import MediaInfo
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from xml.etree.ElementTree import Element, SubElement, Comment, tostring, ElementTree
+from pathlib import Path
+from typing import Generator, List
 
 DEBUG = False
+
+srt_names = {}
+
+class VideoFile:
+    def __init__(self, video_path) -> None:
+        self.orig_path: Path = video_path
+        self.__srt_paths: List[Path] = []
+    
+    def add_subtitle(self, file_path):
+        self.__srt_paths.append(file_path)
+    
+    def get_subtitles(self):
+        return self.__srt_paths
+
+class MkvVideoFile(VideoFile):
+    def __init__(self, video_path) -> None:
+        super().__init__(video_path)
+
+    @property
+    def duration_sec(self): 
+        with open(self.orig_path, 'rb') as f:
+            mkv = enzyme.MKV(f)
+            return mkv.info.duration.total_seconds()
+
+    @property
+    def duration_sec_mediainfo(self): 
+        return MediaInfo.parse(self.orig_path).tracks[0].duration / 1000
 
 def format_time(sec):
     hours, remainder = divmod(sec, 3600)
@@ -120,221 +148,119 @@ def ffmpeg_concat_filter(files, output):
     if mp4_to_mkv_rc:
         raise ValueError("FFMPEG Concat Filter Failed")
 
-def get_video_files(path, skip_dirs=()):
-    # mp4s = []
-    for root, dirs, files in os.walk(os.path.expanduser(path)):
+
+def get_video_files(path: Path, temp_path: Path, skip_dirs=()) -> Generator[VideoFile, None, None]:
+    path = path.expanduser()
+    for root, _, files in os.walk(path):
+        root = Path(root)
         if root in skip_dirs:
             continue
-        all_srts = sorted([f for f in files if f.endswith('.srt')])
-        for f in files:
-            file_name, file_ext = (f.rsplit('.', 1) + [""])[:2]
-            if file_ext != 'mp4':
-                continue
-            srt_files = []
+
+        all_srts = sorted([Path(root, f) for f in files if f.endswith('.srt')])
+        for file in (VideoFile(Path(root, f)) for f in files if f.endswith(".mp4")):
             for srt in all_srts:
-                if srt.startswith(file_name):
-                    srt_suffix = srt[len(file_name):-4]
-                    srt_files.append((srt, srt_suffix))
-            yield root, f, file_name, srt_files
-    #         mp4s.append((root, f, srt_files))
-    # return mp4s
+                if srt.stem.startswith(file.orig_path.stem):
+                    file.add_subtitle(srt)
+            yield file
+
+def convert_to_mkv(input_file: VideoFile, temp_path: Path):
+    tmp_file = Path(temp_path, input_file.orig_path.stem + '.mkv')
+
+    i = 1
+    while tmp_file.is_file():
+        tmp_file = Path(temp_path, input_file.orig_path.stem + f'_{i}.mkv')
+        i += 1
+
+    print('\nCONVERTING MP4s to MKVs\n')
+    mp4_to_mkv_rc = subprocess.call(['ffmpeg', '-i', input_file.orig_path, '-vcodec', 'copy', '-acodec', 'copy', tmp_file])
+    if mp4_to_mkv_rc:
+        raise ValueError('Failed converting mp4 to mkv.')
+    
+    return MkvVideoFile(tmp_file)
+
+
+def add_subtitles_to_mkv(input_file: MkvVideoFile, subtitles: List[Path]):
+    global srt_names
+    if not subtitles:
+        return
+
+    for srt_file in subtitles:
+        if srt_file.suffix not in srt_names:
+            ln = input(f'Give language name for "{srt_file.suffix}" (Default=English): ').strip()
+            sn = input(f'Give language short name for "{srt_file.suffix}" (Default=eng): ').strip()
+            lname = ln if ln else 'English'
+            sname = sn if sn else 'eng'
+            srt_names[srt_file.suffix] = (lname, sname)
+
+    input_path = input_file.orig_path
+    tmp_mkv = Path(input_path.parent, f"{input_path.stem}_tmp{input_path.suffix}")
+    cmd = ['mkvmerge', '-o', tmp_mkv, input_file.orig_path]
+    for srt_file in subtitles:
+        lname, sname = srt_names[srt_file.suffix]
+        cmd += ['--language', f'0:{sname}', '--track-name', f'0:{lname}', srt_file]
+
+    print('\nADDING SRT FILES\n')
+    add_srt_rc = subprocess.call(cmd)
+    if add_srt_rc:
+        raise ValueError("failed adding srt file")
+    tmp_mkv.rename(input_path)
 
 def main():
     parser = argparse.ArgumentParser(description='')
     parser.add_argument('-p', '--path', type=str, help='', required=True)
     args = parser.parse_args()
 
-    main_folder = args.path
-    main_folder_name = os.path.basename(main_folder.strip(os.sep))
+    main_folder = Path(args.path).absolute()
+    main_folder_name = main_folder.name
 
-    # mkv_out = os.path.join(main_folder, 'mkv_out')
-    mkv_tmp = os.path.join(main_folder, 'mkv_tmp')
+    mkv_tmp = Path(main_folder, 'mkv_tmp')
 
-    # try:
-    #     shutil.rmtree(mkv_out)
-    # except:
-    #     pass
     try:
         shutil.rmtree(mkv_tmp)
     except:
         pass
-    # os.mkdir(mkv_out)
-    os.mkdir(mkv_tmp)
+    mkv_tmp.mkdir()
+
     al = OrderedDict()
     all_files = OrderedDict()
-    tmp_files = []
 
-    srt_names = {}
-    for root, mp4_file, mp4_file_name, srt_files in get_video_files(main_folder, skip_dirs=(mkv_tmp, )):
-        mp4_path = os.path.join(root, mp4_file)
-        fname = os.path.basename(root)
+    for video_file in get_video_files(main_folder, temp_path=mkv_tmp, skip_dirs=(mkv_tmp, )):
+        fname = video_file.orig_path.parent.name
         if fname not in all_files:
             all_files[fname] = []
         tmp = []
         total_sec = 0
         total_sec2 = 0
+        mkvfile = convert_to_mkv(video_file, mkv_tmp)
+        add_subtitles_to_mkv(mkvfile, video_file.get_subtitles())
+        sec = mkvfile.duration_sec
+        total_sec += sec
 
-        srt_suffixes = []
-        for srt_file, srt_suffix in srt_files:
-            # srt_suffix = srt_file[len(mp4_file_name):-4]
-            srt_suffixes.append((srt_file, srt_suffix))
-            if srt_suffix not in srt_names:
-                ln = input(f'Give language name for "{srt_suffix}" (Default=English): ').strip()
-                sn = input(f'Give language short name for "{srt_suffix}" (Default=eng): ').strip()
-                lname = ln if ln else 'English'
-                sname = sn if sn else 'eng'
-                srt_names[srt_suffix] = (lname, sname)
-
-        tmp_file = os.path.join(mkv_tmp, mp4_file_name + '.mkv')
-        srt_tmp_file = os.path.join(mkv_tmp, mp4_file_name + '_srt.mkv')
-
-        i = 1
-        while os.path.isfile(tmp_file):
-            tmp_file = os.path.join(mkv_tmp, mp4_file_name + f'_{i}.mkv')
-            srt_tmp_file = os.path.join(mkv_tmp, mp4_file_name + f'_{i}_srt.mkv')
-            i += 1
-
-        print('\nCONVERTING MP4s to MKVs\n')
-        mp4_to_mkv_rc = subprocess.call(['ffmpeg', '-i', mp4_path, '-vcodec', 'copy', '-acodec', 'copy', tmp_file])
-        if mp4_to_mkv_rc:
-            raise ValueError('Failed converting mp4 to mkv.')
-
-        if srt_suffixes:
-            cmd = ['mkvmerge', '-o', srt_tmp_file, tmp_file]
-            for srt_file, srt_suffix in srt_suffixes:
-                lname, sname = srt_names[srt_suffix]
-                cmd += ['--language', f'0:{sname}', '--track-name', f'0:{lname}', os.path.join(root, srt_file)]
-
-            print('\nADDING SRT FILES\n')
-            add_srt_rc = subprocess.call(cmd)
-            if add_srt_rc:
-                raise ValueError("failed adding srt file")
-            shutil.move(srt_tmp_file, tmp_file)
-        # else:
-        #     shutil.copyfile(tmp_file, srt_tmp_file)
-
-        with open(tmp_file, 'rb') as f:
-            mkv = enzyme.MKV(f)
-            sec = mkv.info.duration.total_seconds()
-            total_sec += sec
-
-        sec2 = MediaInfo.parse(tmp_file).tracks[0].duration / 1000
+        sec2 = mkvfile.duration_sec_mediainfo
         total_sec2 += sec2
 
-        # tmp.append((os.path.basename(tmp_file), sec, sec2))
-        # tmp_files.append(tmp_file)
+        all_files[fname].append(mkvfile)
 
-        all_files[fname].append((os.path.basename(tmp_file), sec, sec2))
-        # al[fname] = (tmp, tmp[0][1], tmp[0][2])
-    # for root, dirs, files in os.walk(main_folder):
-    #     if root in [mkv_tmp, mkv_out]:
-    #         continue
-    #     fname = os.path.basename(root)
-    #     all_srts = sorted([f for f in files if f.endswith('.srt')])
-    #     mp4s = []
-    #     for f in files:
-    #         if not f.endswith('.mp4'):
-    #             continue
-    #         found_srts = []
-    #         for srt in all_srts:
-    #             if srt.startswith(f[:-4]):
-    #                 found_srts.append(srt)
-    #         mp4s.append((f, found_srts))
-    #
-    #     # mp4s = sorted([f for f in files if f.endswith('.mp4')])
-    #     if not mp4s:
-    #         continue
-    #     all_files[fname] = []
-    #     tmp = []
-    #     total_sec = 0
-    #     total_sec2 = 0
-    #     for mp4_file, srt_files in mp4s:
-    #         # srt_files = []
-    #         name = mp4_file[:-4]
-    #         mp4_path = os.path.join(root, mp4_file)
-    #         # if srt_files:
-    #         srt_suffixes = []
-    #         for srt_file in srt_files:
-    #             srt_path = os.path.join(root, srt_file)
-    #             srt_suffix = srt_file[len(name):-4]
-    #             srt_suffixes.append((srt_file, srt_suffix))
-    #             if srt_suffix not in srt_names:
-    #                 ln = input(f'Give language name for "{srt_suffix}" (Default=English): ').strip()
-    #                 sn = input(f'Give language short name for "{srt_suffix}" (Default=eng): ').strip()
-    #                 lname = ln if ln else 'English'
-    #                 sname = sn if sn else 'eng'
-    #                 srt_names[srt_suffix] = (lname, sname)
-    #             # print(srt_suffix)
-    #         # srt_path = os.path.join(root, name + '-en.srt')
-    #         # srts = [os.path.join(root, s) for s in all_srts if s.startswith(name)]
-    #         tmp_file = os.path.join(mkv_tmp, name + '.mkv')
-    #         srt_tmp_file = os.path.join(mkv_out, name + '.mkv')
-    #         i = 1
-    #         while os.path.isfile(tmp_file):
-    #             tmp_file = os.path.join(mkv_tmp, name + f'_{i}.mkv')
-    #             srt_tmp_file = os.path.join(mkv_out, name + f'_{i}.mkv')
-    #             i += 1
-    #         # all_files[fname].append((tmp_file, srts))
-    #         # srt_tmp_file = os.path.join(mkv_out, name + '.mkv')
-    #
-    #         print('\nCONVERTING MP4s to MKVs\n')
-    #         mp4_to_mkv_rc = subprocess.call(['ffmpeg', '-i', mp4_path, '-vcodec', 'copy', '-acodec', 'copy', tmp_file])
-    #         if mp4_to_mkv_rc:
-    #             raise ValueError('Failed converting mp4 to mkv.')
-    #         if srt_suffixes:
-    #             cmd = ['mkvmerge', '-o', srt_tmp_file, tmp_file]
-    #             for srt_file, srt_suffix in srt_suffixes:
-    #                 lname, sname = srt_names[srt_suffix]
-    #                 cmd += ['--language', f'0:{sname}', '--track-name', f'0:{lname}', os.path.join(root, srt_file)]
-    #
-    #             print('\nADDING SRT FILES\n')
-    #             add_srt_rc = subprocess.call(cmd)
-    #             if add_srt_rc:
-    #                 raise ValueError("failed adding srt file")
-    #         else:
-    #             shutil.copyfile(tmp_file, srt_tmp_file)
-    #         with open(tmp_file, 'rb') as f:
-    #             mkv = enzyme.MKV(f)
-    #             sec = mkv.info.duration.total_seconds()
-    #             total_sec += sec
-    #         sec2 = MediaInfo.parse(tmp_file).tracks[0].duration / 1000
-    #         total_sec2 += sec2
-    #         tmp.append((os.path.basename(tmp_file), sec, sec2))
-    #         tmp_files.append(tmp_file)
-    #     al[fname] = (tmp, tmp[0][1], tmp[0][2])
-
-    # ffmpeg_concat_filter(tmp_files, output=os.path.join(main_folder, 'concat_output.mkv'))
-    # return
-    # for fname, mkv_files in sorted(all_files.items(), key=lambda x: x[0]):
-    #     print(f'{fname}')
-    #     for f, ss in mkv_files:
-    #         print(f'    {f}')
-    #         for s in ss:
-    #             print(f'        {s}')
     EDITOR = os.environ.get('EDITOR', 'vim')
-    # al = OrderedDict(sorted(al.items(), key=lambda x: x[0])) 
-    # al2 = OrderedDict()
-    # for k, (v, t, t2) in sorted(al.items(), key=lambda x: x[0]):
-    #     # al2[k] = sorted(v)
-    #     # t = sorted(v, key=lambda x: x[0])
-    #     al2[k] = sorted(v, key=lambda x: x[0]), t, t2
+
     al = OrderedDict()
     for k, v in OrderedDict(sorted(all_files.items())).items():
-        al[k] = sorted(v, key=lambda x: x[0])
+        al[k] = sorted(v, key=lambda x: x.orig_path.name)
 
-    # al = OrderedDict([(k, (sorted(v, key=lambda x: x[0]), t, t2)) for k, (v, t, t2) in sorted(al.items(), key=lambda x: x[0])])
     initial_message = f"TITLE {main_folder_name}\n" # if you want to set up the file somehow
     h, e = 0, 0
     ids = OrderedDict()
     for header, entries in al.items():
         initial_message += f'D{h:03} {header}\n'
-        # ids[f'D{h:03}'] = (header, t, t2)
-        for i, (entry, tt, tt2) in enumerate(entries):
+
+        for i, entry in enumerate(entries):
+            tt = entry.duration_sec
+            tt2 = entry.duration_sec_mediainfo
             if i == 0:
                 ids[f'D{h:03}'] = (header, tt, tt2)
 
-            initial_message += f' F{e:03} {entry[:-4]}\n'
-            ids[f'F{e:03}'] = (entry, tt, tt2)
+            initial_message += f' F{e:03} {entry.orig_path.name[:-4]}\n'
+            ids[f'F{e:03}'] = (entry.orig_path.name, tt, tt2)
             e += 1
         initial_message += '\n'
         h += 1
@@ -428,10 +354,4 @@ def main():
 
 
 if __name__ == '__main__':
-    # t = '0:00:01.440000'
-    # import datetime
-    # import time
-    # d = datetime.datetime.strptime(t, '%H:%M:%S.%f') - datetime.datetime(1900,1,1)
-    # # d = time.strptime(t, '%H:%M:%S.%f')
-    # print(d.total_seconds())
     main()
